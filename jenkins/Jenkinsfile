@@ -1,0 +1,2 @@
+// Compatibility wrapper. The root Jenkinsfile is the source of truth.
+load '../Jenkinsfile'

@@ -1,0 +1,12 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    aws-cli \
+    bash \
+    docker-cli \
+    docker-cli-compose \
+    py3-boto3 \
+    py3-pip \
+    python3
+
+WORKDIR /workspace
