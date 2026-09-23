@@ -72,13 +72,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "state" {
   }
 }
 
-resource "aws_cloudwatch_log_group" "cleanup" {
-  name              = "/infra-guard/cleanup"
-  retention_in_days = 14
-
-  tags = local.tags
-}
-
 resource "aws_vpc" "test" {
   cidr_block           = "10.42.0.0/16"
   enable_dns_hostnames = true
@@ -188,15 +181,6 @@ resource "aws_iam_role_policy" "cleanup_runner" {
           "ec2:DescribeTags"
         ]
         Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:*:*:log-group:/infra-guard/cleanup*"
       }
     ]
   })

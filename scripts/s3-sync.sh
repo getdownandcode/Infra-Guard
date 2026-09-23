@@ -8,15 +8,15 @@ SYNC_ROOT=${SYNC_ROOT:-"."}
 
 echo "Starting state synchronization to ${S3_DEST}..."
 
-if [ -d "${SYNC_ROOT}/monitoring/prometheus_data" ]; then
-    echo "Taking Prometheus TSDB snapshot..."
-    mkdir -p snapshots/prometheus
-    tar -czf "snapshots/prometheus/tsdb_$(date +%Y%m%d).tar.gz" "${SYNC_ROOT}/monitoring/prometheus_data" || true
-    aws s3 sync snapshots/prometheus "s3://${S3_BUCKET}/prometheus/snapshots/"
+TFSTATE=""
+if [ -f "${SYNC_ROOT}/terraform/terraform.tfstate" ]; then
+    TFSTATE="${SYNC_ROOT}/terraform/terraform.tfstate"
+elif [ -f "${SYNC_ROOT}/terraform.tfstate" ]; then
+    TFSTATE="${SYNC_ROOT}/terraform.tfstate"
 fi
 
-if [ -f "${SYNC_ROOT}/terraform.tfstate" ]; then
-    aws s3 cp "${SYNC_ROOT}/terraform.tfstate" "${S3_DEST}terraform.tfstate" --sse AES256
+if [ -n "${TFSTATE}" ]; then
+    aws s3 cp "${TFSTATE}" "${S3_DEST}terraform.tfstate" --sse AES256
     echo "Terraform state synchronized."
 else
     echo "No terraform.tfstate found, skipping."
@@ -25,16 +25,6 @@ fi
 if [ -d "${SYNC_ROOT}/monitoring/grafana/provisioning/dashboards" ]; then
     aws s3 sync "${SYNC_ROOT}/monitoring/grafana/provisioning/dashboards" "s3://${S3_BUCKET}/grafana/dashboards/" --sse AES256
     echo "Grafana dashboards synchronized."
-fi
-
-if [ -d "${SYNC_ROOT}/jenkins" ]; then
-    aws s3 sync "${SYNC_ROOT}/jenkins" "s3://${S3_BUCKET}/jenkins/" --exclude "*" --include "*.xml" --sse AES256
-    echo "Jenkins job configs synchronized."
-fi
-
-if [ -d "${SYNC_ROOT}/logs" ]; then
-    aws s3 sync "${SYNC_ROOT}/logs" "s3://${S3_BUCKET}/cleanup-logs/" --delete --sse AES256
-    echo "Cleanup logs synchronized."
 fi
 
 mkdir -p "${SYNC_ROOT}/monitoring/textfile"

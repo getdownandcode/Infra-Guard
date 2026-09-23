@@ -32,7 +32,6 @@ aws-credentials*
 *.tfvars
 *.tfvars.json
 *.tfplan
-*.tflplan
 *.plan
 override.tf
 override.tf.json
@@ -45,10 +44,7 @@ crash.*.log
 !.terraform.lock.hcl
 
 # Generated runtime artifacts
-logs/
-snapshots/
 monitoring/textfile/
-monitoring/prometheus_data/
 
 # OS and editor files
 .DS_Store

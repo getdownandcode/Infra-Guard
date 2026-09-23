@@ -24,8 +24,8 @@ pipeline {
     stages {
         stage('Lint') {
             steps {
-                sh 'python3 -m py_compile scripts/cleanup.py scripts/cleanup_resources.py'
-                sh 'python3 -m json.tool iam/ec2-role-policy.json > /dev/null'
+                sh 'python3 -m py_compile scripts/cleanup.py'
+                sh 'bash -n scripts/bootstrap_s3.sh && bash -n scripts/s3-sync.sh'
             }
         }
 
@@ -66,9 +66,6 @@ pipeline {
     }
 
     post {
-        success {
-            sh 'aws s3 sync logs/ s3://${S3_STATE_BUCKET}/cleanup-logs/ --delete --sse AES256 || true'
-        }
         failure {
             echo 'Infra-Guard pipeline failed.'
         }

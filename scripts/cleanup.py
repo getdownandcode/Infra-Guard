@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
-import io
 import logging
+import logging.handlers
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
 
 
-LOG_GROUP = "/infra-guard/cleanup"
 SKIP_TAG = "infra-guard:skip"
 CLEANUP_TAG = "infra-guard:cleanup"
 
@@ -21,16 +20,9 @@ def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-class MemoryLogHandler(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.stream = io.StringIO()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.stream.write(self.format(record) + "\n")
-
+class MemoryLogHandler(logging.handlers.BufferingHandler):
     def value(self) -> str:
-        return self.stream.getvalue()
+        return "\n".join(self.format(record) for record in self.buffer)
 
 
 def configure_logging() -> MemoryLogHandler:
@@ -97,26 +89,26 @@ def older_than(timestamp: dt.datetime, **kwargs: int) -> bool:
     return timestamp <= utcnow() - dt.timedelta(**kwargs)
 
 
-def stopped_at(instance: Dict) -> dt.datetime:
+def stopped_at(instance: Dict) -> Optional[dt.datetime]:
     reason = instance.get("StateTransitionReason", "")
     match = re.search(r"\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)", reason)
-    if match:
-        return dt.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
-    return instance["LaunchTime"]
+    if not match:
+        return None
+    return dt.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
 
 
-def apply_action(description: str, dry_run: bool, action) -> None:
+def apply_action(description: str, dry_run: bool, action) -> bool:
     if dry_run:
         logging.info("[DRY-RUN] %s", description)
-        return 1
+        return True
 
     try:
         action()
         logging.info("%s", description)
-        return 1
+        return True
     except ClientError as exc:
         logging.error("Failed: %s: %s", description, exc)
-        return 0
+        return False
 
 
 def cleanup_ebs_volumes(
@@ -125,9 +117,10 @@ def cleanup_ebs_volumes(
     min_age_hours: int,
     tag_key: Optional[str],
     tag_value: Optional[str],
-) -> None:
+) -> Tuple[int, int]:
     logging.info("Scanning unattached EBS volumes older than %s hours", min_age_hours)
-    candidates = 0
+    acted = 0
+    failed = 0
     paginator = ec2.get_paginator("describe_volumes")
     for page in paginator.paginate(Filters=[{"Name": "status", "Values": ["available"]}]):
         for volume in page.get("Volumes", []):
@@ -141,17 +134,21 @@ def cleanup_ebs_volumes(
             if not older_than(volume["CreateTime"], hours=min_age_hours):
                 logging.info("Skipping %s because it is newer than threshold", volume_id)
                 continue
-            candidates += apply_action(
+            if apply_action(
                 f"Delete unattached EBS volume {volume_id}",
                 dry_run,
                 lambda volume_id=volume_id: ec2.delete_volume(VolumeId=volume_id),
-            )
-    return candidates
+            ):
+                acted += 1
+            else:
+                failed += 1
+    return acted, failed
 
 
-def cleanup_elastic_ips(ec2, dry_run: bool, tag_key: Optional[str], tag_value: Optional[str]) -> None:
+def cleanup_elastic_ips(ec2, dry_run: bool, tag_key: Optional[str], tag_value: Optional[str]) -> Tuple[int, int]:
     logging.info("Scanning unused Elastic IP addresses")
-    candidates = 0
+    acted = 0
+    failed = 0
     for address in ec2.describe_addresses().get("Addresses", []):
         if address.get("InstanceId") or address.get("NetworkInterfaceId"):
             continue
@@ -165,12 +162,15 @@ def cleanup_elastic_ips(ec2, dry_run: bool, tag_key: Optional[str], tag_value: O
         if has_skip_tag(tags):
             logging.info("Skipping %s because %s=true", allocation_id, SKIP_TAG)
             continue
-        candidates += apply_action(
+        if apply_action(
             f"Release unused Elastic IP {allocation_id}",
             dry_run,
             lambda allocation_id=allocation_id: ec2.release_address(AllocationId=allocation_id),
-        )
-    return candidates
+        ):
+            acted += 1
+        else:
+            failed += 1
+    return acted, failed
 
 
 def cleanup_stopped_instances(
@@ -179,9 +179,10 @@ def cleanup_stopped_instances(
     min_age_days: int,
     tag_key: Optional[str],
     tag_value: Optional[str],
-) -> None:
+) -> Tuple[int, int]:
     logging.info("Scanning stopped EC2 instances older than %s days", min_age_days)
-    candidates = 0
+    acted = 0
+    failed = 0
     paginator = ec2.get_paginator("describe_instances")
     filters = [{"Name": "instance-state-name", "Values": ["stopped"]}]
     for page in paginator.paginate(Filters=filters):
@@ -197,16 +198,22 @@ def cleanup_stopped_instances(
                 if not has_cleanup_tag(tags):
                     logging.info("Skipping %s because %s=true is required", instance_id, CLEANUP_TAG)
                     continue
-                state_time = instance.get("StateTransitionReason", "")
-                if not older_than(stopped_at(instance), days=min_age_days):
+                stop_time = stopped_at(instance)
+                if stop_time is None:
+                    logging.info("Skipping %s because its stop time cannot be determined", instance_id)
+                    continue
+                if not older_than(stop_time, days=min_age_days):
                     logging.info("Skipping %s because it is newer than threshold", instance_id)
                     continue
-                candidates += apply_action(
-                    f"Terminate stopped EC2 instance {instance_id} ({state_time})",
+                if apply_action(
+                    f"Terminate stopped EC2 instance {instance_id} (stopped at {stop_time:%Y-%m-%d %H:%M:%S} UTC)",
                     dry_run,
                     lambda instance_id=instance_id: ec2.terminate_instances(InstanceIds=[instance_id]),
-                )
-    return candidates
+                ):
+                    acted += 1
+                else:
+                    failed += 1
+    return acted, failed
 
 
 def ami_snapshot_ids(ec2) -> Set[str]:
@@ -227,9 +234,10 @@ def cleanup_old_snapshots(
     min_age_days: int,
     tag_key: Optional[str],
     tag_value: Optional[str],
-) -> None:
+) -> Tuple[int, int]:
     logging.info("Scanning owned EBS snapshots older than %s days", min_age_days)
-    candidates = 0
+    acted = 0
+    failed = 0
     protected = ami_snapshot_ids(ec2)
     paginator = ec2.get_paginator("describe_snapshots")
     for page in paginator.paginate(OwnerIds=["self"]):
@@ -247,12 +255,15 @@ def cleanup_old_snapshots(
             if not older_than(snapshot["StartTime"], days=min_age_days):
                 logging.info("Skipping %s because it is newer than threshold", snapshot_id)
                 continue
-            candidates += apply_action(
+            if apply_action(
                 f"Delete old EBS snapshot {snapshot_id}",
                 dry_run,
                 lambda snapshot_id=snapshot_id: ec2.delete_snapshot(SnapshotId=snapshot_id),
-            )
-    return candidates
+            ):
+                acted += 1
+            else:
+                failed += 1
+    return acted, failed
 
 
 def attached_security_group_ids(ec2) -> Set[str]:
@@ -265,9 +276,10 @@ def attached_security_group_ids(ec2) -> Set[str]:
     return group_ids
 
 
-def cleanup_orphaned_security_groups(ec2, dry_run: bool, tag_key: Optional[str], tag_value: Optional[str]) -> None:
+def cleanup_orphaned_security_groups(ec2, dry_run: bool, tag_key: Optional[str], tag_value: Optional[str]) -> Tuple[int, int]:
     logging.info("Scanning orphaned security groups")
-    candidates = 0
+    acted = 0
+    failed = 0
     attached = attached_security_group_ids(ec2)
     paginator = ec2.get_paginator("describe_security_groups")
     for page in paginator.paginate():
@@ -286,27 +298,36 @@ def cleanup_orphaned_security_groups(ec2, dry_run: bool, tag_key: Optional[str],
             if group.get("IpPermissions"):
                 logging.info("Skipping %s because ingress rules still exist", group_id)
                 continue
-            candidates += apply_action(
+            if apply_action(
                 f"Delete orphaned security group {group_id}",
                 dry_run,
                 lambda group_id=group_id: ec2.delete_security_group(GroupId=group_id),
-            )
-    return candidates
+            ):
+                acted += 1
+            else:
+                failed += 1
+    return acted, failed
 
 
-def write_prometheus_metrics(path: str, idle_resources: int, dry_run: bool) -> None:
+def write_prometheus_metrics(path: str, counts: Dict[str, int], dry_run: bool) -> None:
     if not path:
         return
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    estimated_monthly_savings = idle_resources * 5
-    body = "\n".join(
+    lines = [
+        "# HELP infra_guard_idle_resources_total Idle resources found by the latest Infra-Guard run.",
+        "# TYPE infra_guard_idle_resources_total gauge",
+        f"infra_guard_idle_resources_total {sum(counts.values())}",
+    ]
+    for name, count in sorted(counts.items()):
+        lines.extend(
+            [
+                f"# HELP infra_guard_{name} {name.replace('_', ' ')} found by the latest Infra-Guard run.",
+                f"# TYPE infra_guard_{name} gauge",
+                f"infra_guard_{name} {count}",
+            ]
+        )
+    lines.extend(
         [
-            "# HELP infra_guard_idle_resources_total Idle resources found by the latest Infra-Guard run.",
-            "# TYPE infra_guard_idle_resources_total gauge",
-            f"infra_guard_idle_resources_total {idle_resources}",
-            "# HELP infra_guard_monthly_savings_usd Estimated monthly savings from the latest Infra-Guard run.",
-            "# TYPE infra_guard_monthly_savings_usd gauge",
-            f"infra_guard_monthly_savings_usd {estimated_monthly_savings}",
             "# HELP infra_guard_last_run_timestamp Unix timestamp of the latest Infra-Guard cleanup run.",
             "# TYPE infra_guard_last_run_timestamp gauge",
             f"infra_guard_last_run_timestamp {int(utcnow().timestamp())}",
@@ -317,7 +338,7 @@ def write_prometheus_metrics(path: str, idle_resources: int, dry_run: bool) -> N
         ]
     )
     with open(path, "w", encoding="utf-8") as metrics_file:
-        metrics_file.write(body)
+        metrics_file.write("\n".join(lines))
     logging.info("Wrote Prometheus metrics to %s", path)
 
 
@@ -339,42 +360,20 @@ def upload_log_to_s3(s3, bucket: Optional[str], prefix: str, body: str, dry_run:
     logging.info("Uploaded cleanup log to s3://%s/%s", bucket, key)
 
 
-def upload_log_to_cloudwatch(logs, body: str, dry_run: bool) -> None:
-    stream_name = f"cleanup-{utcnow().strftime('%Y%m%dT%H%M%SZ')}"
-    if dry_run:
-        logging.info("[DRY-RUN] Write cleanup log to CloudWatch Logs %s/%s", LOG_GROUP, stream_name)
-        return
-    try:
-        try:
-            logs.create_log_group(logGroupName=LOG_GROUP)
-        except logs.exceptions.ResourceAlreadyExistsException:
-            pass
-        logs.create_log_stream(logGroupName=LOG_GROUP, logStreamName=stream_name)
-        logs.put_log_events(
-            logGroupName=LOG_GROUP,
-            logStreamName=stream_name,
-            logEvents=[{"timestamp": int(utcnow().timestamp() * 1000), "message": body[-250000:]}],
-        )
-        logging.info("Wrote cleanup log to CloudWatch Logs %s/%s", LOG_GROUP, stream_name)
-    except ClientError as exc:
-        logging.error("Failed to write CloudWatch cleanup log: %s", exc)
-
-
 def main() -> int:
     args = get_args()
-    dry_run = not args.confirm or args.dry_run
+    memory_log = configure_logging()
     if args.confirm and args.dry_run:
         logging.error("Use either --dry-run or --confirm, not both")
         return 2
     if args.resource_tag_value is not None and not args.resource_tag_key:
         logging.error("--resource-tag-value requires --resource-tag-key")
         return 2
+    dry_run = not args.confirm
 
-    memory_log = configure_logging()
     session = boto3.Session(region_name=args.region)
     ec2 = session.client("ec2")
     s3 = session.client("s3")
-    logs = session.client("logs")
 
     logging.info("Infra-Guard cleanup starting; mode=%s", "dry-run" if dry_run else "confirm")
     if args.resource_tag_key:
@@ -383,23 +382,29 @@ def main() -> int:
             args.resource_tag_key,
             args.resource_tag_value if args.resource_tag_value is not None else "*",
         )
-    idle_resources = 0
-    idle_resources += cleanup_ebs_volumes(ec2, dry_run, args.ebs_min_age_hours, args.resource_tag_key, args.resource_tag_value)
-    idle_resources += cleanup_elastic_ips(ec2, dry_run, args.resource_tag_key, args.resource_tag_value)
-    idle_resources += cleanup_stopped_instances(
-        ec2,
-        dry_run,
-        args.stopped_instance_min_age_days,
-        args.resource_tag_key,
-        args.resource_tag_value,
-    )
-    idle_resources += cleanup_old_snapshots(ec2, dry_run, args.snapshot_min_age_days, args.resource_tag_key, args.resource_tag_value)
-    idle_resources += cleanup_orphaned_security_groups(ec2, dry_run, args.resource_tag_key, args.resource_tag_value)
-    write_prometheus_metrics(args.metrics_file, idle_resources, dry_run)
+    results = {
+        "idle_ebs_volumes": cleanup_ebs_volumes(ec2, dry_run, args.ebs_min_age_hours, args.resource_tag_key, args.resource_tag_value),
+        "unused_elastic_ips": cleanup_elastic_ips(ec2, dry_run, args.resource_tag_key, args.resource_tag_value),
+        "stopped_instances": cleanup_stopped_instances(
+            ec2,
+            dry_run,
+            args.stopped_instance_min_age_days,
+            args.resource_tag_key,
+            args.resource_tag_value,
+        ),
+        "old_snapshots": cleanup_old_snapshots(ec2, dry_run, args.snapshot_min_age_days, args.resource_tag_key, args.resource_tag_value),
+        "orphaned_security_groups": cleanup_orphaned_security_groups(ec2, dry_run, args.resource_tag_key, args.resource_tag_value),
+    }
+    counts = {name: acted for name, (acted, _) in results.items()}
+    failed = sum(failed for _, failed in results.values())
+    write_prometheus_metrics(args.metrics_file, counts, dry_run)
 
     log_body = memory_log.value()
-    upload_log_to_cloudwatch(logs, log_body, dry_run)
     upload_log_to_s3(s3, args.log_bucket, args.log_prefix, log_body, dry_run)
+
+    if failed:
+        logging.error("Infra-Guard cleanup completed with %s failed action(s)", failed)
+        return 1
     logging.info("Infra-Guard cleanup completed")
     return 0
 
