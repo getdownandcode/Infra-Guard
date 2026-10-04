@@ -20,9 +20,16 @@ def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-class MemoryLogHandler(logging.handlers.BufferingHandler):
+class MemoryLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.buffer.append(self.format(record))
+
     def value(self) -> str:
-        return "\n".join(self.format(record) for record in self.buffer)
+        return "\n".join(self.buffer)
 
 
 def configure_logging() -> MemoryLogHandler:
@@ -61,16 +68,22 @@ def get_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def tags_to_dict(tags: Optional[Iterable[Dict[str, str]]]) -> Dict[str, str]:
-    return {tag.get("Key", ""): tag.get("Value", "") for tag in tags or []}
+def tags_to_dict(tags: Optional[Iterable[Dict[str, Optional[str]]]]) -> Dict[str, str]:
+    return {
+        str(tag.get("Key") or ""): str(tag.get("Value") or "")
+        for tag in tags or []
+        if tag.get("Key") is not None
+    }
 
 
 def has_skip_tag(tags: Dict[str, str]) -> bool:
-    return tags.get(SKIP_TAG, "").lower() == "true"
+    val = tags.get(SKIP_TAG)
+    return val is not None and str(val).lower() == "true"
 
 
 def has_cleanup_tag(tags: Dict[str, str]) -> bool:
-    return tags.get(CLEANUP_TAG, "").lower() == "true"
+    val = tags.get(CLEANUP_TAG)
+    return val is not None and str(val).lower() == "true"
 
 
 def matches_resource_tag_filter(tags: Dict[str, str], tag_key: Optional[str], tag_value: Optional[str]) -> bool:
@@ -90,7 +103,7 @@ def older_than(timestamp: dt.datetime, **kwargs: int) -> bool:
 
 
 def stopped_at(instance: Dict) -> Optional[dt.datetime]:
-    reason = instance.get("StateTransitionReason", "")
+    reason = instance.get("StateTransitionReason") or ""
     match = re.search(r"\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)", reason)
     if not match:
         return None
@@ -246,7 +259,9 @@ def cleanup_old_snapshots(
             tags = tags_to_dict(snapshot.get("Tags"))
             if not matches_resource_tag_filter(tags, tag_key, tag_value):
                 continue
-            if has_skip_tag(tags) or tags.get("keep", "").lower() == "true":
+            keep_val = tags.get("keep")
+            is_keep = keep_val is not None and str(keep_val).lower() == "true"
+            if has_skip_tag(tags) or is_keep:
                 logging.info("Skipping %s because it is protected by tag", snapshot_id)
                 continue
             if snapshot_id in protected:
@@ -309,10 +324,11 @@ def cleanup_orphaned_security_groups(ec2, dry_run: bool, tag_key: Optional[str],
     return acted, failed
 
 
-def write_prometheus_metrics(path: str, counts: Dict[str, int], dry_run: bool) -> None:
+def write_prometheus_metrics(path: str, counts: Dict[str, int], failed: int, dry_run: bool) -> None:
     if not path:
         return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
     lines = [
         "# HELP infra_guard_idle_resources_total Idle resources found by the latest Infra-Guard run.",
         "# TYPE infra_guard_idle_resources_total gauge",
@@ -328,6 +344,12 @@ def write_prometheus_metrics(path: str, counts: Dict[str, int], dry_run: bool) -
         )
     lines.extend(
         [
+            "# HELP infra_guard_cleanup_failures_total Total failed cleanup actions in the latest Infra-Guard run.",
+            "# TYPE infra_guard_cleanup_failures_total gauge",
+            f"infra_guard_cleanup_failures_total {failed}",
+            "# HELP infra_guard_cleanup_success Whether the latest Infra-Guard run completed without failures.",
+            "# TYPE infra_guard_cleanup_success gauge",
+            f"infra_guard_cleanup_success {1 if failed == 0 else 0}",
             "# HELP infra_guard_last_run_timestamp Unix timestamp of the latest Infra-Guard cleanup run.",
             "# TYPE infra_guard_last_run_timestamp gauge",
             f"infra_guard_last_run_timestamp {int(utcnow().timestamp())}",
@@ -337,27 +359,34 @@ def write_prometheus_metrics(path: str, counts: Dict[str, int], dry_run: bool) -
             "",
         ]
     )
-    with open(path, "w", encoding="utf-8") as metrics_file:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as metrics_file:
         metrics_file.write("\n".join(lines))
+    os.replace(tmp_path, path)
     logging.info("Wrote Prometheus metrics to %s", path)
 
 
-def upload_log_to_s3(s3, bucket: Optional[str], prefix: str, body: str, dry_run: bool) -> None:
+def upload_log_to_s3(s3, bucket: Optional[str], prefix: str, body: str, dry_run: bool) -> bool:
     if not bucket:
         logging.info("No cleanup log bucket configured; skipping S3 log upload")
-        return
+        return True
     key = f"{prefix.rstrip('/')}/cleanup-{utcnow().strftime('%Y%m%dT%H%M%SZ')}.log"
     if dry_run:
         logging.info("[DRY-RUN] Upload cleanup log to s3://%s/%s", bucket, key)
-        return
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=body.encode("utf-8"),
-        ServerSideEncryption="AES256",
-        ContentType="text/plain",
-    )
-    logging.info("Uploaded cleanup log to s3://%s/%s", bucket, key)
+        return True
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body.encode("utf-8"),
+            ServerSideEncryption="AES256",
+            ContentType="text/plain",
+        )
+        logging.info("Uploaded cleanup log to s3://%s/%s", bucket, key)
+        return True
+    except ClientError as exc:
+        logging.error("Failed to upload cleanup log to s3://%s/%s: %s", bucket, key, exc)
+        return False
 
 
 def main() -> int:
@@ -397,16 +426,19 @@ def main() -> int:
     }
     counts = {name: acted for name, (acted, _) in results.items()}
     failed = sum(failed for _, failed in results.values())
-    write_prometheus_metrics(args.metrics_file, counts, dry_run)
+    write_prometheus_metrics(args.metrics_file, counts, failed, dry_run)
+
+    exit_code = 0
+    if failed:
+        logging.error("Infra-Guard cleanup completed with %s failed action(s)", failed)
+        exit_code = 1
+    else:
+        logging.info("Infra-Guard cleanup completed successfully")
 
     log_body = memory_log.value()
     upload_log_to_s3(s3, args.log_bucket, args.log_prefix, log_body, dry_run)
 
-    if failed:
-        logging.error("Infra-Guard cleanup completed with %s failed action(s)", failed)
-        return 1
-    logging.info("Infra-Guard cleanup completed")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

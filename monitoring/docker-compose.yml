@@ -9,7 +9,7 @@ services:
       - prometheus_data:/prometheus
     restart: unless-stopped
 
-  node_exporter:
+  node-exporter:
     image: prom/node-exporter:v1.8.1
     container_name: infra-guard-node-exporter
     command:

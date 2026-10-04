@@ -44,7 +44,8 @@ crash.*.log
 !.terraform.lock.hcl
 
 # Generated runtime artifacts
-monitoring/textfile/
+monitoring/textfile/*
+!monitoring/textfile/.gitkeep
 
 # OS and editor files
 .DS_Store

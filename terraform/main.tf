@@ -4,6 +4,10 @@ data "aws_ssm_parameter" "amazon_linux_2023" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
 
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 resource "random_id" "suffix" {
   byte_length = 4
 }
@@ -85,7 +89,7 @@ resource "aws_vpc" "test" {
 resource "aws_subnet" "test" {
   vpc_id                  = aws_vpc.test.id
   cidr_block              = "10.42.1.0/24"
-  availability_zone       = "${var.aws_region}a"
+  availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = false
 
   tags = merge(local.tags, {
@@ -156,7 +160,11 @@ resource "aws_iam_role_policy" "cleanup_runner" {
           "s3:PutObject",
           "s3:GetObject",
           "s3:ListBucket",
-          "s3:GetBucketVersioning"
+          "s3:GetBucketVersioning",
+          "s3:CreateBucket",
+          "s3:PutBucketVersioning",
+          "s3:PutEncryptionConfiguration",
+          "s3:PutLifecycleConfiguration"
         ]
         Resource = [
           aws_s3_bucket.state.arn,

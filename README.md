@@ -18,7 +18,13 @@ EC2 instance profile. It does not hardcode an AWS account.
 
 Any supported resource tagged `infra-guard:skip=true` is ignored.
 
-## AWS connection
+## Installation & AWS Connection
+
+Install the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
 
 Verify the active account before running anything that can mutate AWS:
 
@@ -30,11 +36,12 @@ aws configure list
 ## S3 state bucket
 
 Create or repair the versioned state bucket (versioning, AES-256 encryption, Glacier
-lifecycle for old noncurrent versions):
+lifecycle for old noncurrent versions). If `S3_STATE_BUCKET` is not set, the script
+defaults to an account-specific name (`infra-guard-state-<account-id>-<region>`) to prevent
+global name collisions:
 
 ```bash
 export AWS_DEFAULT_REGION=ap-south-1
-export S3_STATE_BUCKET=infra-guard-state
 bash scripts/bootstrap_s3.sh
 ```
 
@@ -43,18 +50,20 @@ bash scripts/bootstrap_s3.sh
 Dry-run is the default safe operating mode:
 
 ```bash
-python3 scripts/cleanup.py --dry-run --log-bucket "$S3_STATE_BUCKET"
+python3 scripts/cleanup.py --dry-run
 ```
 
 Actual cleanup requires explicit confirmation:
 
 ```bash
-python3 scripts/cleanup.py --confirm --log-bucket "$S3_STATE_BUCKET"
+python3 scripts/cleanup.py --confirm
 ```
 
 Useful options:
 
 - `--region` — AWS region override
+- `--log-bucket` — S3 bucket for cleanup logs
+- `--log-prefix` — S3 prefix for cleanup logs (default: `cleanup-logs`)
 - `--resource-tag-key` / `--resource-tag-value` — restrict cleanup to tagged resources
 - `--ebs-min-age-hours`, `--stopped-instance-min-age-days`, `--snapshot-min-age-days` — age thresholds
 - `--metrics-file` — Prometheus textfile output path (default `monitoring/textfile/infra_guard.prom`)
@@ -85,8 +94,8 @@ docker compose up -d
 ```
 
 - Prometheus: `http://localhost:9090`
-- node_exporter: `http://localhost:9100` (exposes the textfile metrics)
-- Grafana: `http://localhost:3000` (defaults to `admin`/`admin`)
+- node-exporter: `http://localhost:9100` (exposes the textfile metrics)
+- Grafana: `http://localhost:3000` (defaults to `admin`/`admin`, includes auto-provisioned "Infra-Guard Overview" dashboard)
 
 See [monitoring/README.md](monitoring/README.md).
 
@@ -96,5 +105,6 @@ The root `Jenkinsfile` is the source of truth. Jenkins builds `Dockerfile.jenkin
 so the AWS CLI, Python, boto3, Bash, and Docker Compose are available without installing
 tools during the run. Jenkins must provide AWS credentials through its credentials store,
 instance profile, or environment. The pipeline lints the scripts, validates the AWS
-identity, bootstraps S3, runs cleanup in dry-run mode, applies cleanup on `main` or the
-weekly cron, syncs state to S3, and deploys the monitoring stack.
+identity, bootstraps S3, runs cleanup in dry-run mode, applies cleanup on scheduled weekly
+cron or when confirmed via the `CONFIRM_CLEANUP` parameter, syncs state to S3, and deploys
+the monitoring stack.

@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: 'Infra-Guard'
+    orgId: 1
+    folder: 'Infra-Guard'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
