@@ -59,3 +59,7 @@ Desktop.ini
 # Docker/local compose overrides
 docker-compose.override.yml
 compose.override.yml
+
+# Future planning and internal roadmaps
+FUTURE_IMPROVEMENTS.md
+FUTURE_*.md
