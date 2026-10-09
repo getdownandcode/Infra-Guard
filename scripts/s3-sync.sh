@@ -4,18 +4,8 @@ set -e
 START_TIME=$(date +%s)
 AWS_REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-"ap-south-1"}}
 SYNC_ROOT=${SYNC_ROOT:-"."}
-
-if [ -z "${S3_STATE_BUCKET}" ]; then
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-    if [ -n "${ACCOUNT_ID}" ]; then
-        S3_BUCKET="infra-guard-state-${ACCOUNT_ID}-${AWS_REGION}"
-    else
-        S3_BUCKET="infra-guard-state"
-    fi
-else
-    S3_BUCKET="${S3_STATE_BUCKET}"
-fi
-
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+S3_BUCKET=${S3_STATE_BUCKET:-"infra-guard-state${ACCOUNT_ID:+-$ACCOUNT_ID-$AWS_REGION}"}
 S3_DEST="s3://${S3_BUCKET}/terraform/"
 
 write_metrics() {
@@ -37,11 +27,9 @@ trap 'write_metrics 0' ERR
 echo "Starting state synchronization to ${S3_DEST}..."
 
 TFSTATE=""
-if [ -f "${SYNC_ROOT}/terraform/terraform.tfstate" ]; then
-    TFSTATE="${SYNC_ROOT}/terraform/terraform.tfstate"
-elif [ -f "${SYNC_ROOT}/terraform.tfstate" ]; then
-    TFSTATE="${SYNC_ROOT}/terraform.tfstate"
-fi
+for f in "${SYNC_ROOT}/terraform/terraform.tfstate" "${SYNC_ROOT}/terraform.tfstate"; do
+    [ -f "$f" ] && TFSTATE="$f" && break
+done
 
 if [ -n "${TFSTATE}" ]; then
     aws s3 cp "${TFSTATE}" "${S3_DEST}terraform.tfstate" --region "${AWS_REGION}" --sse AES256
