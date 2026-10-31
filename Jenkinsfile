@@ -32,6 +32,7 @@ pipeline {
             steps {
                 sh 'python3 -m py_compile scripts/cleanup.py'
                 sh 'python3 scripts/cleanup.py --help > /dev/null'
+                sh 'python3 -m unittest discover -s tests -v'
                 sh 'bash -n scripts/bootstrap_s3.sh && bash -n scripts/s3-sync.sh'
             }
         }
@@ -52,17 +53,12 @@ pipeline {
                 }
             }
             steps {
-                script {
-                    def bucketArg = env.S3_STATE_BUCKET ? "--log-bucket ${env.S3_STATE_BUCKET}" : ""
-                    def tagArgs = ""
-                    if (params.RESOURCE_TAG_KEY) {
-                        tagArgs += " --resource-tag-key ${params.RESOURCE_TAG_KEY}"
-                        if (params.RESOURCE_TAG_VALUE) {
-                            tagArgs += " --resource-tag-value ${params.RESOURCE_TAG_VALUE}"
-                        }
-                    }
-                    sh "python3 scripts/cleanup.py --confirm ${bucketArg} ${tagArgs}"
-                }
+                sh '''
+                    BUCKET_FLAG="${S3_STATE_BUCKET:+--log-bucket $S3_STATE_BUCKET}"
+                    TAG_KEY_FLAG="${RESOURCE_TAG_KEY:+--resource-tag-key $RESOURCE_TAG_KEY}"
+                    TAG_VAL_FLAG="${RESOURCE_TAG_VALUE:+--resource-tag-value $RESOURCE_TAG_VALUE}"
+                    python3 scripts/cleanup.py --confirm $BUCKET_FLAG $TAG_KEY_FLAG $TAG_VAL_FLAG
+                '''
             }
         }
 

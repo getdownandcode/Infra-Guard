@@ -2,33 +2,17 @@
 set -e
 
 AWS_REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-"ap-south-1"}}
-
-if [ -z "${S3_STATE_BUCKET}" ]; then
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-    if [ -n "${ACCOUNT_ID}" ]; then
-        S3_BUCKET="infra-guard-state-${ACCOUNT_ID}-${AWS_REGION}"
-    else
-        S3_BUCKET="infra-guard-state"
-    fi
-else
-    S3_BUCKET="${S3_STATE_BUCKET}"
-fi
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+S3_BUCKET=${S3_STATE_BUCKET:-"infra-guard-state${ACCOUNT_ID:+-$ACCOUNT_ID-$AWS_REGION}"}
 
 echo "Ensuring s3://${S3_BUCKET} exists in ${AWS_REGION}..."
 
 if aws s3api head-bucket --bucket "${S3_BUCKET}" --region "${AWS_REGION}" 2>/dev/null; then
     echo "Bucket already exists and is accessible."
 else
-    if [ "${AWS_REGION}" = "us-east-1" ]; then
-        aws s3api create-bucket \
-            --bucket "${S3_BUCKET}" \
-            --region "${AWS_REGION}"
-    else
-        aws s3api create-bucket \
-            --bucket "${S3_BUCKET}" \
-            --region "${AWS_REGION}" \
-            --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
-    fi
+    LOC_ARGS=()
+    [ "${AWS_REGION}" != "us-east-1" ] && LOC_ARGS=(--create-bucket-configuration "LocationConstraint=${AWS_REGION}")
+    aws s3api create-bucket --bucket "${S3_BUCKET}" --region "${AWS_REGION}" "${LOC_ARGS[@]}"
 fi
 
 aws s3api put-bucket-versioning \
@@ -40,36 +24,20 @@ aws s3api put-bucket-encryption \
     --bucket "${S3_BUCKET}" \
     --region "${AWS_REGION}" \
     --server-side-encryption-configuration '{
-      "Rules": [
-        {
-          "ApplyServerSideEncryptionByDefault": {
-            "SSEAlgorithm": "AES256"
-          }
-        }
-      ]
+      "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
     }'
 
 aws s3api put-bucket-lifecycle-configuration \
     --bucket "${S3_BUCKET}" \
     --region "${AWS_REGION}" \
     --lifecycle-configuration '{
-      "Rules": [
-        {
-          "ID": "archive-old-noncurrent-state",
-          "Status": "Enabled",
-          "Filter": { "Prefix": "" },
-          "NoncurrentVersionTransitions": [
-            {
-              "NoncurrentDays": 90,
-              "StorageClass": "GLACIER"
-            }
-          ],
-          "NoncurrentVersionExpiration": {
-            "NewerNoncurrentVersions": 30,
-            "NoncurrentDays": 365
-          }
-        }
-      ]
+      "Rules": [{
+        "ID": "archive-old-noncurrent-state",
+        "Status": "Enabled",
+        "Filter": { "Prefix": "" },
+        "NoncurrentVersionTransitions": [{"NoncurrentDays": 90, "StorageClass": "GLACIER"}],
+        "NoncurrentVersionExpiration": {"NewerNoncurrentVersions": 30, "NoncurrentDays": 365}
+      }]
     }'
 
 echo "Bucket versioning, AES-256 encryption, and lifecycle policy are configured."
